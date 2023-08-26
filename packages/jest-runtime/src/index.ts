@@ -9,7 +9,6 @@ import nativeModule = require('module');
 import * as path from 'path';
 import {URL, fileURLToPath, pathToFileURL} from 'url';
 import {
-  Script,
   // @ts-expect-error: experimental, not added to the types
   SourceTextModule,
   // @ts-expect-error: experimental, not added to the types
@@ -17,6 +16,7 @@ import {
   Context as VMContext,
   // @ts-expect-error: experimental, not added to the types
   Module as VMModule,
+  compileFunction,
 } from 'vm';
 import {parse as parseCjs} from 'cjs-module-lexer';
 import {CoverageInstrumenter, V8Coverage} from 'collect-v8-coverage';
@@ -144,8 +144,6 @@ const isWasm = (modulePath: string): boolean => modulePath.endsWith('.wasm');
 const unmockRegExpCache = new WeakMap();
 
 const EVAL_RESULT_VARIABLE = 'Object.<anonymous>';
-
-type RunScriptEvalResult = {[EVAL_RESULT_VARIABLE]: ModuleWrapper};
 
 const runtimeSupportsVmModules = typeof SyntheticModule === 'function';
 
@@ -347,7 +345,7 @@ export default class Runtime {
       ...config.modulePathIgnorePatterns,
       ...(options && options.watch ? config.watchPathIgnorePatterns : []),
       config.cacheDirectory.startsWith(config.rootDir + path.sep) &&
-        config.cacheDirectory,
+      config.cacheDirectory,
     ].filter(Boolean);
     const ignorePattern =
       ignorePatternParts.length > 0
@@ -1390,16 +1388,16 @@ export default class Runtime {
   private _resolveCjsModule(from: string, to: string | undefined) {
     return to
       ? this._resolver.resolveModule(from, to, {
-          conditions: this.cjsConditions,
-        })
+        conditions: this.cjsConditions,
+      })
       : from;
   }
 
   private _resolveModule(from: string, to: string | undefined) {
     return to
       ? this._resolver.resolveModuleAsync(from, to, {
-          conditions: this.esmConditions,
-        })
+        conditions: this.esmConditions,
+      })
       : from;
   }
 
@@ -1529,22 +1527,26 @@ export default class Runtime {
       value: this._createRequireImplementation(module, options),
     });
 
-    const transformedCode = this.transformFile(filename, options);
-
     let compiledFunction: ModuleWrapper | null = null;
-
-    const script = this.createScriptFromCode(transformedCode, filename);
-
-    let runScript: RunScriptEvalResult | null = null;
 
     const vmContext = this._environment.getVmContext();
 
     if (vmContext) {
-      runScript = script.runInContext(vmContext, {filename});
-    }
-
-    if (runScript !== null) {
-      compiledFunction = runScript[EVAL_RESULT_VARIABLE];
+      try {
+        compiledFunction = compileFunction(
+          this.transformFile(filename, options),
+          this.constructInjectedModuleParameters(),
+          {
+            filename,
+            parsingContext: vmContext,
+            // memory leaks when importModuleDynamically is implemented
+            // // @ts-expect-error: Experimental ESM API
+            // importModuleDynamically: () => {}
+          },
+        ) as ModuleWrapper;
+      } catch (e: any) {
+        throw handlePotentialSyntaxError(e);
+      }
     }
 
     if (compiledFunction === null) {
@@ -1656,40 +1658,6 @@ export default class Runtime {
       this._sourceMapRegistry.set(filename, transformedFile.sourceMapPath);
     }
     return transformedFile.code;
-  }
-
-  private createScriptFromCode(scriptSource: string, filename: string) {
-    try {
-      const scriptFilename = this._resolver.isCoreModule(filename)
-        ? `jest-nodejs-core-${filename}`
-        : filename;
-      return new Script(this.wrapCodeInModuleWrapper(scriptSource), {
-        columnOffset: this._fileTransforms.get(filename)?.wrapperLength,
-        displayErrors: true,
-        filename: scriptFilename,
-        // @ts-expect-error: Experimental ESM API
-        importModuleDynamically: async (specifier: string) => {
-          invariant(
-            runtimeSupportsVmModules,
-            'You need to run with a version of node that supports ES Modules in the VM API. See https://jestjs.io/docs/ecmascript-modules',
-          );
-
-          const context = this._environment.getVmContext?.();
-
-          invariant(context, 'Test environment has been torn down');
-
-          const module = await this.resolveModule(
-            specifier,
-            scriptFilename,
-            context,
-          );
-
-          return this.linkAndEvaluateModule(module);
-        },
-      });
-    } catch (e: any) {
-      throw handlePotentialSyntaxError(e);
-    }
   }
 
   private _requireCoreModule(moduleName: string, supportPrefix: boolean) {
@@ -1883,7 +1851,7 @@ export default class Runtime {
       if (mockMetadata == null) {
         throw new Error(
           `Failed to get mock metadata: ${modulePath}\n\n` +
-            'See: https://jestjs.io/docs/manual-mocks#content',
+          'See: https://jestjs.io/docs/manual-mocks#content',
         );
       }
       this._mockMetaDataCache.set(modulePath, mockMetadata);
@@ -2063,7 +2031,7 @@ export default class Runtime {
     const moduleRequire = (
       options?.isInternalModule
         ? (moduleName: string) =>
-            this.requireInternalModule(from.filename, moduleName)
+          this.requireInternalModule(from.filename, moduleName)
         : this.requireModuleOrMock.bind(this, from.filename)
     ) as NodeRequire;
     moduleRequire.extensions = Object.create(null);
@@ -2227,10 +2195,10 @@ export default class Runtime {
       typeof this._moduleMocker.replaceProperty === 'function'
         ? this._moduleMocker.replaceProperty.bind(this._moduleMocker)
         : () => {
-            throw new Error(
-              'Your test environment does not support `jest.replaceProperty` - please ensure its Jest dependencies are updated to version 29.4 or later',
-            );
-          };
+          throw new Error(
+            'Your test environment does not support `jest.replaceProperty` - please ensure its Jest dependencies are updated to version 29.4 or later',
+          );
+        };
 
     const setTimeout: Jest['setTimeout'] = timeout => {
       this._environment.global[testTimeoutSymbol] = timeout;
@@ -2418,10 +2386,6 @@ export default class Runtime {
         noStackTrace: false,
       })}`,
     );
-  }
-
-  private wrapCodeInModuleWrapper(content: string) {
-    return `${this.constructModuleWrapperStart() + content}\n}});`;
   }
 
   private constructModuleWrapperStart() {
